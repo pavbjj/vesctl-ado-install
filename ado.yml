@@ -1,0 +1,226 @@
+trigger:
+- none
+
+# Set desired XC namespace
+parameters:
+- name: namespace
+  displayName: 'Terraform Environment'
+  type: string
+
+variables:
+  TF_GLOBAL_DIR: 'global'
+  TF_WORKING_DIR: 'terraform-ssl/environments/${{ parameters.namespace }}'
+  TF_CERTS_DIR: 'terraform-ssl/certs'
+
+# Placeholder for additional steps
+stages:
+- stage: Checkmarx
+  displayName: 'Checkmarx'
+  jobs:
+  - job: Checkmarx
+    displayName: 'Checkmarx'
+    steps:
+    - script: |
+        echo "checkmarx stage"
+
+# Stage : Validate and Plan
+- stage: TerraformValidateAndPlan
+  displayName: 'Terraform Validate and Plan'
+  jobs:
+  - job: ValidateAndPlan
+    displayName: 'Validate and Plan'
+    steps:
+    - script: |
+        echo "Installing Terraform"
+        wget https://releases.hashicorp.com/terraform/1.7.5/terraform_1.7.5_linux_amd64.zip
+        unzip terraform_1.7.5_linux_amd64.zip
+        sudo mv terraform /usr/local/bin/
+      displayName: 'Install Terraform'
+
+    - script: |
+        echo "Installing vesctl"
+      
+        # Download the vesctl tar.gz file
+        curl -LO "https://vesio.azureedge.net/releases/vesctl/$(curl -s https://downloads.volterra.io/releases/vesctl/latest.txt)/vesctl.linux-amd64.gz" || {
+          echo "Failed to download vesctl"
+          exit 1
+        }
+
+        # Extract the tar.gz file
+        gunzip vesctl.linux-amd64.gz || {
+          echo "Failed to extract vesctl"
+          exit 1
+        }
+
+        # Make the vesctl binary executable
+        chmod +x vesctl.linux-amd64 || {
+          echo "Failed to make vesctl executable"
+          exit 1
+        }
+
+        # Move vesctl to /usr/local/bin
+        sudo mv vesctl.linux-amd64 /usr/local/bin/vesctl || {
+          echo "Failed to move vesctl to /usr/local/bin"
+          exit 1
+        }
+
+        # Verify vesctl installation
+        if ! vesctl version; then
+          echo "vesctl installation failed"
+          exit 1
+        fi
+      displayName: 'Install vesctl'
+
+
+    - task: DownloadSecureFile@1
+      name: DownloadP12
+      displayName: 'Download p12.p12 from Azure DevOps Library'
+      inputs:
+        secureFile: 'p12.p12'
+
+    - task: DownloadSecureFile@1
+      name: DownloadPFX
+      displayName: 'Download certificate.pfx from ADO Library'
+      inputs:
+        secureFile: 'certificate.pfx'
+
+    - script: |
+        echo "Moving secure files to working directories"
+        mv $(DownloadP12.secureFilePath) $(TF_GLOBAL_DIR)/p12.p12
+        mkdir -p $(TF_CERTS_DIR)
+        mv $(DownloadPFX.secureFilePath) $(TF_CERTS_DIR)/certificate.pfx
+        openssl pkcs12 -in $(TF_CERTS_DIR)/certificate.pfx -clcerts -nokeys -out $(TF_CERTS_DIR)/certificate.crt -passin pass:$(PFX_PASSWORD)
+        openssl pkcs12 -in $(TF_CERTS_DIR)/certificate.pfx -nocerts -out $(TF_CERTS_DIR)/private_with_pass.key -passin pass:$(PFX_PASSWORD) -passout pass:$(PFX_PASSWORD)
+        openssl rsa -in $(TF_CERTS_DIR)/private_with_pass.key -out $(TF_CERTS_DIR)/private.key -passin pass:$(PFX_PASSWORD)
+        rm -f $(TF_CERTS_DIR)/private_with_pass.key
+        ls -l $(TF_GLOBAL_DIR)
+        ls -l $(TF_CERTS_DIR)
+        ls -l $(TF_WORKING_DIR)
+      displayName: 'Download .pfx and strip passwords'
+
+    - script: |
+        cd $(TF_WORKING_DIR)
+        terraform init
+        terraform plan -out=tfplan
+      displayName: 'Terraform Plan'
+      env:
+        ARM_CLIENT_ID: $(CLIENT_ID)
+        ARM_CLIENT_SECRET: $(CLIENT_SECRET)
+        ARM_SUBSCRIPTION_ID: $(SUBSCRIPTION_ID)
+        ARM_TENANT_ID: $(TENANT_ID)
+        VES_P12_PASSWORD: $(VES_P12_PASSWORD)
+
+    - publish: $(TF_WORKING_DIR)/tfplan
+      artifact: tfplan
+      displayName: 'Publish Plan Artifact'
+
+# Stage : Manual Approval
+- stage: AdminApprove
+  displayName: 'Approval'
+  dependsOn: TerraformValidateAndPlan
+  jobs:
+  - job: approve
+    pool: server
+    displayName: Wait for approval
+    steps: 
+    - task: ManualValidation@0
+      timeoutInMinutes: 60
+      inputs:
+        notifyUsers: 'user@domain.com'
+        instructions: 'Review the plan in the next hour'
+
+# Stage : Terraform Apply
+- stage: TerraformApply
+  displayName: 'Terraform Apply'
+  dependsOn: AdminApprove
+  condition: succeeded('AdminApprove')
+  jobs:
+  - job: Apply
+    displayName: 'Terraform Apply'
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+    - download: current
+      artifact: tfplan
+      displayName: 'Download tfplan Artifact'
+
+    - script: |
+        echo "Installing Terraform"
+        wget https://releases.hashicorp.com/terraform/1.7.5/terraform_1.7.5_linux_amd64.zip
+        unzip terraform_1.7.5_linux_amd64.zip
+        sudo mv terraform /usr/local/bin/
+      displayName: 'Install Terraform'
+
+    - script: |
+        echo "Installing vesctl"
+      
+        # Download the vesctl tar.gz file
+        curl -LO "https://vesio.azureedge.net/releases/vesctl/$(curl -s https://downloads.volterra.io/releases/vesctl/latest.txt)/vesctl.linux-amd64.gz" || {
+          echo "Failed to download vesctl"
+          exit 1
+        }
+
+        # Extract the tar.gz file
+        gunzip vesctl.linux-amd64.gz || {
+          echo "Failed to extract vesctl"
+          exit 1
+        }
+
+        # Make the vesctl binary executable
+        chmod +x vesctl.linux-amd64 || {
+          echo "Failed to make vesctl executable"
+          exit 1
+        }
+
+        # Move vesctl to /usr/local/bin
+        sudo mv vesctl.linux-amd64 /usr/local/bin/vesctl || {
+          echo "Failed to move vesctl to /usr/local/bin"
+          exit 1
+        }
+
+        # Verify vesctl installation
+        if ! vesctl version; then
+          echo "vesctl installation failed"
+          exit 1
+        fi
+      displayName: 'Install vesctl'
+
+
+    - task: DownloadSecureFile@1
+      name: DownloadP12Apply
+      displayName: 'Download p12.p12 for Apply Stage'
+      inputs:
+        secureFile: 'p12.p12'
+
+    - task: DownloadSecureFile@1
+      name: DownloadPFX
+      displayName: 'Download certificate.pfx from ADO Library'
+      inputs:
+        secureFile: 'certificate.pfx'
+
+    - script: |
+        echo "Moving secure files to working directories"
+        mv $(DownloadP12.secureFilePath) $(TF_GLOBAL_DIR)/p12.p12
+        mkdir -p $(TF_CERTS_DIR)
+        mv $(DownloadPFX.secureFilePath) $(TF_CERTS_DIR)/certificate.pfx
+        openssl pkcs12 -in $(TF_CERTS_DIR)/certificate.pfx -clcerts -nokeys -out $(TF_CERTS_DIR)/certificate.crt -passin pass:$(PFX_PASSWORD)
+        openssl pkcs12 -in $(TF_CERTS_DIR)/certificate.pfx -nocerts -out $(TF_CERTS_DIR)/private_with_pass.key -passin pass:$(PFX_PASSWORD) -passout pass:$(PFX_PASSWORD)
+        openssl rsa -in $(TF_CERTS_DIR)/private_with_pass.key -out $(TF_CERTS_DIR)/private.key -passin pass:$(PFX_PASSWORD)
+        rm -f $(TF_CERTS_DIR)/private_with_pass.key
+        ls -l $(TF_GLOBAL_DIR)
+        ls -l $(TF_CERTS_DIR)
+        ls -l $(TF_WORKING_DIR)
+      displayName: 'Download .pfx and strip passwords'
+
+    - script: |
+        mv $(Pipeline.Workspace)/tfplan/tfplan $(TF_WORKING_DIR)/tfplan
+        cd $(TF_WORKING_DIR)
+        terraform init
+        terraform apply -auto-approve tfplan
+      displayName: 'Terraform Apply'
+      env:
+        ARM_CLIENT_ID: $(CLIENT_ID)
+        ARM_CLIENT_SECRET: $(CLIENT_SECRET)
+        ARM_SUBSCRIPTION_ID: $(SUBSCRIPTION_ID)
+        ARM_TENANT_ID: $(TENANT_ID)
+        VES_P12_PASSWORD: $(VES_P12_PASSWORD)
